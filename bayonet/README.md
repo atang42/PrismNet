@@ -15,6 +15,3 @@ Build
 
 2. Run `./build.sh`.
 
-Usage
------
-`./bayonet inputfile.bayonet > outputfile.psi`

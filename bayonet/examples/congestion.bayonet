@@ -23,20 +23,20 @@ packet_fields{ dst }
 programs{ H0 -> h0, H1 -> h1, S0 -> s0, S1 -> s1, S2 -> s2 }
 
 
-def h0(pkt, port) state pkt_count(0){
+def h0(pkt, port) state h0_pkt_count(0){
 	new;
-	if pkt_count < NUM_PACKETS {
+	if h0_pkt_count < NUM_PACKETS {
 		new;
-		pkt_count = pkt_count + 1;
+		h0_pkt_count = h0_pkt_count + 1;
 		pkt.dst = H1;
 		fwd(1);
 	} else { drop; drop; }
 }
 
-def h1(pkt, port) state pkt_count(0){ pkt_count = pkt_count + 1; drop; }
+def h1(pkt, port) state h1_pkt_count(0){ h1_pkt_count = h1_pkt_count + 1; drop; }
 
 
-def s0(pkt, port) state route1(0), route2(0){
+def s0(pkt, port) state s0_route1(0), s0_route2(0){
 	if port == 1{
 		fwd(3);
 	}else if port == 2{
@@ -46,9 +46,9 @@ def s0(pkt, port) state route1(0), route2(0){
 			fwd(1);
 		}
 	}else if port == 3{
-		route1 = COST_01;
-		route2 = COST_02 + COST_21;
-		if route1 < route2 or route1 == route2 and flip(1/2) {
+		s0_route1 = COST_01;
+		s0_route2 = COST_02 + COST_21;
+		if s0_route1 < s0_route2 or s0_route1 == s0_route2 and flip(1/2) {
 			fwd(1);
 		}else{
 			fwd(2);
@@ -56,7 +56,7 @@ def s0(pkt, port) state route1(0), route2(0){
 	}
 }
 
-def s1(pkt, port) state route1(0), route2(0){
+def s1(pkt, port) state s1_route1(0), s1_route2(0){
 	if port == 1 {
 		fwd(3);
 	}else if port == 2{
@@ -66,9 +66,9 @@ def s1(pkt, port) state route1(0), route2(0){
 			fwd(1);
 		}
 	}else if port == 3{
-		route1 = COST_01;
-		route2 = COST_02 + COST_21;
-		if route1 < route2 or route1 == route2 and flip(1/2){
+		s1_route1 = COST_01;
+		s1_route2 = COST_02 + COST_21;
+		if s1_route1 < s1_route2 or s1_route1 == s1_route2 and flip(1/2){
 			fwd(1);
 		}else{
 			fwd(2);

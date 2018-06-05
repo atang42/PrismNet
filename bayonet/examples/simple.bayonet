@@ -1,8 +1,8 @@
 num_steps 10;
-query expectation(pkt_count@H0);
-query expectation(pkt_count@H1);
+query expectation(h0_pkt_count@H0);
+query expectation(s0_pkt_count@H1);
 
-parameters{ P }
+parameters{ Pr }
 
 topology{
     nodes{H0,H1,S0}
@@ -16,16 +16,16 @@ packet_fields{ dst }
 
 programs{ H0->h0, H1->h1, S0->s0 }
 
-def h0(pkt,port) state pkt_count(0){
+def h0(pkt,port) state h0_pkt_count(0){
 	new;
-    pkt_count = pkt_count+1;
+    h0_pkt_count = h0_pkt_count+1;
     pkt.dst = 1;
     fwd(1);
 }
 
 def s0(pkt,port){
     if port == 1{
-		if flip(P){
+		if flip(Pr){
 			fwd(2);
 		}else{
 			drop;
@@ -35,8 +35,8 @@ def s0(pkt,port){
     }
 }
 
-def h1(pkt,port) state pkt_count(0){
-    pkt_count = pkt_count+1;
+def h1(pkt,port) state h1_pkt_count(0){
+    h1_pkt_count = h1_pkt_count+1;
 	drop;
 }
 
