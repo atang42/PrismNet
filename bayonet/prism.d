@@ -35,32 +35,37 @@ class PrismBuilder{
         }
         string toPRISM(){
             //TODO: Get correct capacity
+            //TODO: Get correct value ranges
             int capacity = 3; 
             string r="module "~name~"\n";
 
             string inStatements = "";
             for(int i = 0; i < capacity; i++)
             {
-                inStatements ~= name ~ "_in"~to!string(i)~"_port: int;\n";
+                inStatements ~= name ~ "_in"~to!string(i)~"_port: [0..k];\n";
                 foreach(Variable var; packetFields) {
-                    inStatements ~= name ~ "_in"~to!string(i)~"_pkt_"~var.name~": int;\n";
+                    inStatements ~= name ~ "_in"~to!string(i)~"_pkt_"~var.name~": [0..k];\n";
                 }
             }
 
             string outStatements = "";
             for(int i = 0; i < capacity; i++)
             {
-                outStatements ~= name ~ "_out"~to!string(i)~"_port: int;\n";
+                outStatements ~= name ~ "_out"~to!string(i)~"_port: [0..k];\n";
                 foreach(Variable var; packetFields) {
-                    outStatements ~= name ~ "_out"~to!string(i)~"_pkt_"~var.name~": int;\n";
+                    outStatements ~= name ~ "_out"~to!string(i)~"_pkt_"~var.name~": [0..k];\n";
                 }
             }
 
+            string sizeVars = name ~ "_in_size : [0.."~capacity.to!string~"];\n" 
+                            ~ name ~ "_out_size : [0.."~capacity.to!string~"];\n";
+
             r~=indent(
-                    inStatements ~
-                    outStatements ~
-                    "\n"
-                    );
+                inStatements ~
+                outStatements ~
+                sizeVars ~
+                "\n"
+                );
 
             foreach(string var; stateSet.keys.sort) {
                 r~= indent(var ~ ": int;\n");
@@ -278,7 +283,7 @@ class PrismProgramTranslator {
                     assert(call.args.length == 1, text("TODO: ", exp));
 
                     flipProbs ~= call.args[0];
-                    string flipName = "flip_"~to!string(numFlips);
+                    string flipName = getFlipVar(numFlips);
                     numFlips++;
                     return new Identifier(flipName);
                 }
@@ -292,12 +297,13 @@ class PrismProgramTranslator {
             string action = "[" ~ prgname ~ "Step] ";
 
             string ret = "";
-            string hasFlipsImplies = numFlips > 0 ? prgname~"HasFlips = 1 -> " : "true -> ";
-            string hasFlipsAnd = numFlips > 0 ? prgname~"HasFlips = 1 & " : "";
+            string hasFlipsImplies = numFlips > 0 ? prgname~"HasFlips -> " : "true -> ";
+            string hasFlipsAnd = numFlips > 0 ? prgname~"HasFlips & " : "";
+            string hasFlipsZero = numFlips > 0 ? " & (" ~prgname~"HasFlips'=false)" : "";
             foreach(State st; this.states) {
                 if(st.condition !is null) {
                     string cond = st.condition.toString.replace("and", "&");
-                    cond.replace("or", "|");
+                    cond = cond.replace(" or ", " | ");
                     cond = cond.replace("==", "=");
                     ret ~= action ~ hasFlipsAnd ~ cond ~ " -> ";
                 }
@@ -315,9 +321,16 @@ class PrismProgramTranslator {
                     first = false;
                     ret ~= "(" ~ s ~ "'=" ~ exp.toString() ~ ")";
                 }
+                if(first) // no change in state
+                    ret ~= "true";
+                ret ~= hasFlipsZero;
                 ret ~= ";\n";
             }
             return ret;
+        }
+
+        string getFlipVar(int i) {
+            return prgname ~ "_flip_" ~ i.to!string;
         }
 
         // Output flip variable declarations
@@ -325,9 +338,9 @@ class PrismProgramTranslator {
             string ret = "";
             if(numFlips > 0) {
                 for(int i = 0; i < numFlips; i++) {
-                    ret ~= "flip_" ~ i.to!string ~ ": int;\n";
+                    ret ~= getFlipVar(i) ~ ": [0..1];\n";
                 }
-                ret ~= prgname~"HasFlips : int;\n";
+                ret ~= prgname~"HasFlips : bool;\n";
             }
             return ret;
         }
@@ -336,8 +349,8 @@ class PrismProgramTranslator {
         string getPrismGenRand() {
             //TODO: May be incorrect if Expressions are not numbers
             if(numFlips > 0) {
-                string ret = "[" ~ prgname ~"GenRand] "~prgname~"HasFlips = 0 -> ";
-                ret ~= genRandHelper(0, "1", "("~prgname~"HasFlips'=1)");
+                string ret = "[" ~ prgname ~"GenRand] !"~prgname~"HasFlips -> ";
+                ret ~= genRandHelper(0, "1", "("~prgname~"HasFlips'=true)");
                 ret ~= ";\n";
                 return ret;
             }
@@ -351,10 +364,10 @@ class PrismProgramTranslator {
             auto invProb = (string s) => ("1-("~s~")");
             // one case
             string oneProb = probAcc ~ " * (" ~ flipProbs[i].toString() ~")";
-            string oneAsgn = assignAcc ~ " & (flip_" ~ i.to!string ~"'=1)";
+            string oneAsgn = assignAcc ~ " & (" ~ getFlipVar(i) ~ "'=1)";
             // zero case
             string zeroProb = probAcc ~ " * (" ~ invProb(flipProbs[i].toString()) ~")";
-            string zeroAsgn = assignAcc ~ " & (flip_" ~ i.to!string ~"'=0)";
+            string zeroAsgn = assignAcc ~ " & (" ~ getFlipVar(i) ~"'=0)";
 
             return genRandHelper(i+1, oneProb, oneAsgn) ~ " + " ~ genRandHelper(i+1, zeroProb, zeroAsgn);
         }
@@ -396,7 +409,7 @@ class PrismProgramTranslator {
 
     // Create an Expression for the "drop" statement
     Expression generateDrop(string prgname, int capacity, string[] fields) {
-        //TODO: Add condition size > 0
+        // Shift packets forward
         alias AssignExp = BinaryExp!(Tok!"=");
         Expression[] assigns;
         for(int i = 0; i < capacity - 1; i++)
@@ -416,7 +429,15 @@ class PrismProgramTranslator {
         Expression minusExpr = new BinaryExp!(Tok!"-")(sizeVar, new LiteralExp(tok));
         assigns ~= new AssignExp(sizeVar, minusExpr);
 
-        Expression ret = new CompoundExp(assigns);
+        CompoundExp compound = new CompoundExp(assigns);
+
+        // Add condition for input queue size greater than zero
+        Token capTok = Token(Tok!"0");
+        capTok.int64 = 0;
+
+        Expression condition = new BinaryExp!(Tok!">")(sizeVar, new LiteralExp(capTok));
+        Expression ret = new IteExp(condition, compound, new CompoundExp([]));
+        
         return ret;
     }
 
@@ -491,7 +512,6 @@ class PrismProgramTranslator {
         return ret;
     }       
 
-
     class MyBinExp: ABinaryExp {
         string op;
         this(Expression left, string op, Expression right) { super(left, right); this.op = op; }
@@ -545,6 +565,40 @@ class PrismProgramTranslator {
            return call;
            }
          */
+        assert(0,text("TODO: ",exp));
+    }
+
+    // Prepend prgname to Identifiers to ensure names are unique
+    Expression changeStateVarName(Expression exp, string prgname) {
+        if(auto lit = cast(LiteralExp)exp) {
+            assert(lit.lit.type==Tok!"0",text("TODO: ",lit));
+            return lit;
+        }
+        else if(auto fe = cast(FieldExp)exp) {
+            return fe;
+        }
+        else if(auto be = cast(ABinaryExp)exp) {
+
+            Expression e1 = changeStateVarName(be.e1, prgname);
+            Expression e2 = changeStateVarName(be.e2, prgname);
+            Expression myBin = new MyBinExp(e1, be.operator, e2);
+            return myBin;
+        }
+        else if(auto be = cast(UnaryExp!(Tok!"!"))exp) {
+            be.e = changeStateVarName(be.e, prgname);
+            return be;
+        }
+
+        else if(auto id = cast(Identifier)exp) {
+            if(id.name == "port") {
+                return id;
+            }
+            return new Identifier(prgname~"_"~id.name);
+        }
+        else if(auto call = cast(CallExp)exp) {
+            return call;
+        }
+         
         assert(0,text("TODO: ",exp));
     }
 
