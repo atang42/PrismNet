@@ -1,0 +1,5 @@
+bayonet
+maketable
+*~
+*.o
+dmd2/

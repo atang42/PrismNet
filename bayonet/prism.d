@@ -1,0 +1,670 @@
+import std.conv, std.algorithm, std.range, std.array;
+import lexer, expression, declaration, util;
+
+import std.typecons: Q=Tuple,q=tuple;
+
+class PrismBuilder{
+    class Variable{
+        string name;
+        string type;
+        Expression init_;
+        this(string name,string type,Expression init_=null){
+            this.name=name;
+            this.type=type;
+            this.init_=init_;
+        }
+        string toPRISM(){
+            return "Variable.toPsi: "~name~": "~type;
+        }
+        string toPRISMInit()in{assert(!!init_);}body{
+            return "Variable.toPsiInit: "~name~" = "~init_.toString()~";";
+        }
+    }
+    class Program{
+        string name;
+        Expression prgbody;
+        string[] pFields;
+
+        this(string name, Expression prgbody){
+            this.name=name;
+            this.prgbody = prgbody;
+        }
+        void addState(string name, expression.Expression init_=null){
+            state~=new Variable(name,name=="pkt"?"Packet":"int",init_);
+            stateSet[name]=[];
+        }
+        string toPRISM(){
+            //TODO: Get correct capacity
+            int capacity = 3; 
+            string r="module "~name~"\n";
+
+            string inStatements = "";
+            for(int i = 0; i < capacity; i++)
+            {
+                inStatements ~= name ~ "_in"~to!string(i)~"_port: int;\n";
+                foreach(Variable var; packetFields) {
+                    inStatements ~= name ~ "_in"~to!string(i)~"_pkt_"~var.name~": int;\n";
+                }
+            }
+
+            string outStatements = "";
+            for(int i = 0; i < capacity; i++)
+            {
+                outStatements ~= name ~ "_out"~to!string(i)~"_port: int;\n";
+                foreach(Variable var; packetFields) {
+                    outStatements ~= name ~ "_out"~to!string(i)~"_pkt_"~var.name~": int;\n";
+                }
+            }
+
+            r~=indent(
+                    inStatements ~
+                    outStatements ~
+                    "\n"
+                    );
+
+            foreach(string var; stateSet.keys.sort) {
+                r~= indent(var ~ ": int;\n");
+            }
+
+            string[] fields = packetFields.map!(v => v.name).array;
+            PrismProgramTranslator ppt = new PrismProgramTranslator();
+            PrismProgramTranslator.ProgramPath paths = ppt.getAllExecutions(prgbody, stateSet.keys, name, fields);
+
+            r~= indent(paths.getPrismFlipDecl());
+            r~= indent(paths.getPrismGenRand());
+            r~= indent(paths.getPrismStep());
+            r~="endmodule\n";
+
+            return r;
+        }
+        void[0][string] stateSet;
+        private:
+        Variable[] state;
+    }
+    Program addProgram(string name, Expression expr){
+        auto r=new Program(name, expr);
+        programs~=r;
+        return r;
+    }
+    void addPacketField(string name){
+        packetFields~=new Variable(name,"int");
+    }
+    void addNode(string name)in{assert(name !in nodeId);}body{
+        nodeId[name]=cast(int)nodes.length;
+        nodes~=name;
+    }
+    void addProgram(string node,string name)in{assert(node in nodeId);}body{
+        foreach(i,p;programs) if(p.name==name){ // TODO: replace linear lookup
+            nodeProg[nodeId[node]]=cast(int)i;
+            return;
+        }
+        assert(0);
+    }
+    void addLink(InterfaceDecl a,InterfaceDecl b){
+        auto x=q(a.node.name,a.port), y=q(b.node.name,b.port);
+        links[x[0]][x[1]]=y;
+        links[y[0]][y[1]]=x;
+    }
+    void addParam(ParameterDecl p){
+        params~=p;
+    }
+    void addScheduler(FunctionDef scheduler){
+        this.scheduler=scheduler;
+    }
+    void addPostObserve(Expression decl){
+        postObserves~=decl;
+    }
+    void addNumSteps(NumStepsDecl numSteps){
+        this.num_steps = numSteps.num_steps;
+    }
+    void addQueueCapacity(QueueCapacityDecl capacity){
+        this.capacity = capacity.capacity;
+    }
+    void addQuery(QueryDecl query){
+        queries~=query.query;
+    }
+
+    string toPRISM(){
+        auto nodedef="const int k = "~text(nodes.length)~";\n"~iota(nodes.length).map!(k=>text("const ",nodes[k]," = ",k)).join(";\n")~(nodes.length?";\n":"");
+        auto paramdef=params.map!(p=>"const int "~ p.name.toString()~" = "~(p.init_?p.init_.toString():"?"~p.name.toString())).join(";\n")~(params.length?";\n\n":"");
+
+        return nodedef~paramdef~programs.map!(a=>a.toPRISM()~"\n").join;
+    }
+
+    Variable[] packetFields;
+    private:
+    Program[] programs;
+    string[] nodes;
+    ParameterDecl[] params;
+    int[string] nodeId;
+    int[int] nodeProg;
+    Q!(string,int)[int][string] links;
+    FunctionDef scheduler;
+    Expression[] queries;
+    Expression num_steps;
+    Expression capacity;
+    Expression[] postObserves;
+}
+
+class PrismProgramTranslator {
+
+    this () {}
+
+    // The state of a program after executing one branch
+    class State {
+        Expression condition;
+        Expression[string] mapping;
+
+        this(Expression c, Expression[string] m) {
+            this.condition = condition;
+            this.mapping = m;
+        }
+
+        this(string[] variables) {
+            condition = null;
+            foreach(string var; variables) {
+                mapping[var] = new Identifier(var);
+            }
+        }
+
+        State copy() {
+            State c = new State(mapping.keys);
+            c.condition = this.condition;
+            foreach(string s, Expression e; this.mapping) {
+                c.mapping[s] = e;
+            }
+            return c;
+        }
+
+        override string toString() {
+            string r = (condition is null ? "" : condition.toString())  ~ "\n";
+            foreach(string s; mapping.keys.sort) {
+                r ~= "\t" ~ s ~ " " ~ mapping[s].toString() ~ "\n";
+            }
+            return r;
+        }
+    }
+
+    // All states possible from program
+    class ProgramPath {
+        State[] states;
+        int numFlips;
+        Expression[] flipProbs;
+        string prgname;
+        string[] fields;
+        int capacity;
+
+        this () {}
+
+        this(string[] variables, string prgname, string[] packetFields) {
+            //TODO: Get correct capacity
+            this.capacity = 3;
+            void[0][string] queueVariables;
+            queueVariables[prgname~"_in_size"] = [];
+            queueVariables[prgname~"_out_size"] = [];
+            for(int i = 0; i < capacity; i++) {
+                queueVariables[prgname~"_in"~to!string(i)~"_port"] = [];
+                queueVariables[prgname~"_out"~to!string(i)~"_port"] = [];
+                foreach(string f; packetFields) {
+                    queueVariables[prgname~"_in"~to!string(i)~"_pkt_"~f] = [];
+                    queueVariables[prgname~"_out"~to!string(i)~"_pkt_"~f] = [];
+                }
+            }
+            states = [new State(variables~queueVariables.keys)];
+            this.prgname = prgname;
+            this.fields = packetFields;
+        }
+
+        // Create copy of this object;
+        ProgramPath copy() {
+            ProgramPath c = new ProgramPath();
+            c.numFlips = this.numFlips;
+            c.flipProbs = this.flipProbs;
+            c.prgname = this.prgname;
+            c.fields = this.fields;
+            c.capacity = this.capacity;
+            c.states = new State[this.states.length];
+            foreach(int i, State s; this.states) {
+                c.states[i] = s.copy();
+            }
+            return c;
+        }
+
+        // Update a variable with an expression
+        void updateState(string var, Expression exp) {
+            exp = replaceFlips(exp);
+            foreach(State s; states) {
+                s.mapping[var] = substituteExpression(exp, s, prgname);
+            }
+        }
+
+        // Add an extra constraint on the paths
+        void updateCondition(Expression cond) {
+            cond = replaceFlips(cond);
+            foreach(State s; states) {
+                if(s.condition is null) {
+                    s.condition = substituteExpression(cond, s, prgname);
+                }
+                else {
+                    s.condition = new BinaryExp!(Tok!"and")(substituteExpression(cond, s, prgname), s.condition);
+                }
+            }
+        }
+
+        // Recursively traverse Expression tree replacing flip() with variables
+        Expression replaceFlips(Expression exp) {
+            if(auto lit = cast(LiteralExp)exp) {
+                assert(lit.lit.type==Tok!"0",text("TODO: ",lit));
+                return lit;
+            }
+            else if(auto fe = cast(FieldExp)exp) {
+                return fe;
+            }
+            else if(auto be = cast(ABinaryExp)exp) {
+                be.e1 = replaceFlips(be.e1);
+                be.e2 = replaceFlips(be.e2);
+                return be;
+            }
+            else if(auto be = cast(UnaryExp!(Tok!"!"))exp) {
+                be.e = replaceFlips(be.e);
+                return be;
+            }
+            else if(auto id = cast(Identifier)exp) {
+                return id;
+            }
+            else if(auto call = cast(CallExp)exp) {
+                if(auto fname = cast(Identifier)call.e) {
+                    assert(fname.name == "flip", text("TODO: ", exp));
+                    assert(call.args.length == 1, text("TODO: ", exp));
+
+                    flipProbs ~= call.args[0];
+                    string flipName = "flip_"~to!string(numFlips);
+                    numFlips++;
+                    return new Identifier(flipName);
+                }
+                return call;
+            }
+            assert(0,text("TODO: ", typeid(exp), exp));
+        }
+
+        // Output Step Actions
+        string getPrismStep() {
+            string action = "[" ~ prgname ~ "Step] ";
+
+            string ret = "";
+            string hasFlipsImplies = numFlips > 0 ? prgname~"HasFlips = 1 -> " : "true -> ";
+            string hasFlipsAnd = numFlips > 0 ? prgname~"HasFlips = 1 & " : "";
+            foreach(State st; this.states) {
+                if(st.condition !is null) {
+                    string cond = st.condition.toString.replace("and", "&");
+                    cond.replace("or", "|");
+                    cond = cond.replace("==", "=");
+                    ret ~= action ~ hasFlipsAnd ~ cond ~ " -> ";
+                }
+                else {
+                    ret ~= action ~ hasFlipsImplies;
+                }
+                bool first = true;
+                foreach(string s, Expression exp; st.mapping) {
+                    if(s.equal(exp.toString())) {
+                        continue;
+                    }
+                    if(!first) {
+                        ret ~= " & ";
+                    }
+                    first = false;
+                    ret ~= "(" ~ s ~ "'=" ~ exp.toString() ~ ")";
+                }
+                ret ~= ";\n";
+            }
+            return ret;
+        }
+
+        // Output flip variable declarations
+        string getPrismFlipDecl() {
+            string ret = "";
+            if(numFlips > 0) {
+                for(int i = 0; i < numFlips; i++) {
+                    ret ~= "flip_" ~ i.to!string ~ ": int;\n";
+                }
+                ret ~= prgname~"HasFlips : int;\n";
+            }
+            return ret;
+        }
+
+        // Output randomness generation
+        string getPrismGenRand() {
+            //TODO: May be incorrect if Expressions are not numbers
+            if(numFlips > 0) {
+                string ret = "[" ~ prgname ~"GenRand] "~prgname~"HasFlips = 0 -> ";
+                ret ~= genRandHelper(0, "1", "("~prgname~"HasFlips'=1)");
+                ret ~= ";\n";
+                return ret;
+            }
+            return "";
+        }
+
+        string genRandHelper(int i, string probAcc, string assignAcc) {
+            if(i >= flipProbs.length) {
+                return probAcc ~ " : " ~ assignAcc;
+            }
+            auto invProb = (string s) => ("1-("~s~")");
+            // one case
+            string oneProb = probAcc ~ " * (" ~ flipProbs[i].toString() ~")";
+            string oneAsgn = assignAcc ~ " & (flip_" ~ i.to!string ~"'=1)";
+            // zero case
+            string zeroProb = probAcc ~ " * (" ~ invProb(flipProbs[i].toString()) ~")";
+            string zeroAsgn = assignAcc ~ " & (flip_" ~ i.to!string ~"'=0)";
+
+            return genRandHelper(i+1, oneProb, oneAsgn) ~ " + " ~ genRandHelper(i+1, zeroProb, zeroAsgn);
+        }
+
+
+        override string toString() {
+            string r = "numFlips = " ~ to!string(numFlips) ~ "\n";
+            r ~= "prgname = " ~ prgname ~ "\n";
+            foreach(State s; states) {
+                r ~= s.toString();
+            }
+            return r;
+        }
+    }
+
+    string inFieldVar(string prgname, string field, int i) {
+        return prgname ~ "_in" ~ to!string(i) ~ "_pkt_" ~ field;
+    }
+
+    string inPortVar(string prgname, int i) {
+        return prgname ~ "_in" ~ to!string(i) ~ "_port";
+    }
+
+    string inSizeVar(string prgname) {
+        return prgname ~ "_in_size";
+    }
+
+    string outFieldVar(string prgname, string field, int i) {
+        return prgname ~ "_out" ~ to!string(i) ~ "_pkt_" ~ field;
+    }
+
+    string outPortVar(string prgname, int i) {
+        return prgname ~ "_out" ~ to!string(i) ~ "_port";
+    }
+
+    string outSizeVar(string prgname) {
+        return prgname ~ "_out_size";
+    }
+
+    // Create an Expression for the "drop" statement
+    Expression generateDrop(string prgname, int capacity, string[] fields) {
+        //TODO: Add condition size > 0
+        alias AssignExp = BinaryExp!(Tok!"=");
+        Expression[] assigns;
+        for(int i = 0; i < capacity - 1; i++)
+        {
+            Expression lhsPort = new Identifier(inPortVar(prgname, i));
+            Expression rhsPort = new Identifier(inPortVar(prgname, i+1));
+            assigns ~= new AssignExp(lhsPort, rhsPort);
+            foreach(string f; fields) {
+                Expression lhsField = new Identifier(inFieldVar(prgname, f, i));
+                Expression rhsField = new Identifier(inFieldVar(prgname, f, i+1));
+                assigns ~= new AssignExp(lhsField, rhsField);
+            }
+        }
+        Expression sizeVar = new Identifier(inSizeVar(prgname));
+        Token tok = Token(Tok!"0");
+        tok.int64 = 1;
+        Expression minusExpr = new BinaryExp!(Tok!"-")(sizeVar, new LiteralExp(tok));
+        assigns ~= new AssignExp(sizeVar, minusExpr);
+
+        Expression ret = new CompoundExp(assigns);
+        return ret;
+    }
+
+    // Create an Expression for the "new" statement
+    Expression generateNew(string prgname, int capacity, string[] fields) {
+        alias AssignExp = BinaryExp!(Tok!"=");
+
+        // Shift input queue back
+        Expression[] assigns;
+        for(int i = capacity-2; i >= 0; i--)
+        {
+            Expression lhsPort = new Identifier(inPortVar(prgname, i+1));
+            Expression rhsPort = new Identifier(inPortVar(prgname, i));
+            assigns ~= new AssignExp(lhsPort, rhsPort);
+            foreach(string f; fields) {
+                Expression lhsField = new Identifier(inFieldVar(prgname, f, i+1));
+                Expression rhsField = new Identifier(inFieldVar(prgname, f, i));
+                assigns ~= new AssignExp(lhsField, rhsField);
+            }
+        }
+        Expression sizeVar = new Identifier(inSizeVar(prgname));
+        Token tok = Token(Tok!"0");
+        tok.int64 = 1;
+        Expression plusExpr = new BinaryExp!(Tok!"+")(sizeVar, new LiteralExp(tok));
+        assigns ~= new AssignExp(sizeVar, plusExpr);
+
+        CompoundExp compound = new CompoundExp(assigns);
+
+        // If input queue size less than capacity
+        Token capTok = Token(Tok!"0");
+        capTok.int64 = capacity;
+
+        Expression condition = new BinaryExp!(Tok!"<")(sizeVar, new LiteralExp(capTok));
+        Expression ret = new IteExp(condition, compound, new CompoundExp([]));
+        return ret;
+    }   
+    // Create an Expression for the "fwd" statement
+    Expression generateFwd(string prgname, int capacity, string[] fields, Expression destPort) {
+        //TODO: Add condition size > 0
+        alias AssignExp = BinaryExp!(Tok!"=");
+        Expression[] assigns;
+
+        // Move from in queue to out queue
+        //TODO: Add output queueing
+        Expression outPort = new Identifier(outPortVar(prgname, 0));
+        assigns ~= new AssignExp(outPort, destPort);
+        foreach(string f; fields) {
+            Expression outField = new Identifier(outFieldVar(prgname, f, 0));
+            Expression inField = new Identifier(inFieldVar(prgname, f, 0));
+            assigns ~= new AssignExp(outField, inField);
+        }
+
+        // Shift elements in input queue
+        for(int i = 0; i < capacity - 1; i++)
+        {
+            Expression lhsPort = new Identifier(inPortVar(prgname, i));
+            Expression rhsPort = new Identifier(inPortVar(prgname, i+1));
+            assigns ~= new AssignExp(lhsPort, rhsPort);
+            foreach(string f; fields) {
+                Expression lhsField = new Identifier(inFieldVar(prgname, f, i));
+                Expression rhsField = new Identifier(inFieldVar(prgname, f, i+1));
+                assigns ~= new AssignExp(lhsField, rhsField);
+            }
+        }
+        Expression sizeVar = new Identifier(inSizeVar(prgname));
+        Token tok = Token(Tok!"0");
+        tok.str = "1";
+        Expression minusExpr = new BinaryExp!(Tok!"-")(sizeVar, new LiteralExp(tok));
+        assigns ~= new AssignExp(sizeVar, minusExpr);
+
+        Expression ret = new CompoundExp(assigns);
+        return ret;
+    }       
+
+
+    class MyBinExp: ABinaryExp {
+        string op;
+        this(Expression left, string op, Expression right) { super(left, right); this.op = op; }
+
+        override string toString() {
+            return _brk(e1.toString() ~ " " ~ op ~ " " ~ e2.toString());
+        }
+        override @property string operator() { return op; }
+    }
+
+    Expression substituteExpression(Expression exp, State state, string prgname) {
+        if(auto lit = cast(LiteralExp)exp) {
+            assert(lit.lit.type==Tok!"0",text("TODO: ",lit));
+            return lit;
+        }
+        else if(auto fe = cast(FieldExp)exp) {
+            string fieldstring = inFieldVar(prgname, fe.f.name, 0); 
+            return state.mapping[fieldstring];
+            return fe;
+        }
+        else if(auto be = cast(ABinaryExp)exp) {
+
+            Expression e1 = substituteExpression(be.e1, state, prgname);
+            Expression e2 = substituteExpression(be.e2, state, prgname);
+            Expression myBin = new MyBinExp(e1, be.operator, e2);
+            return myBin;
+        }
+        else if(auto be = cast(UnaryExp!(Tok!"!"))exp) {
+            be.e = substituteExpression(be.e, state, prgname);
+            return be;
+        }
+
+        else if(auto id = cast(Identifier)exp) {
+            Expression* e = (id.name in state.mapping);
+            if (e !is null) {
+                return *e;
+            }
+            else if(id.name == "port") {
+                return state.mapping[inPortVar(prgname, 0)];
+            }
+            return id;
+        }
+        /*
+           else if(auto call = cast(CallExp)exp) {
+           if(auto fname = cast(Identifier)call.e) {
+           assert(fname.name == "flip", text("TODO: ", exp));
+           numFlips++;
+           string flipName = "flip_"~to!string(numFlips);
+           return new Identifier(flipName);
+           }
+           return call;
+           }
+         */
+        assert(0,text("TODO: ",exp));
+    }
+
+    ProgramPath getAllExecutions(Expression stm, ProgramPath paths) {
+        if(auto be=cast(ABinaryExp)stm){
+
+            if(cast(BinaryExp!(Tok!"="))be){
+                Identifier id = cast(Identifier)be.e1;
+                FieldExp fe = cast(FieldExp)be.e1;
+                if(id && id.name in paths.states[0].mapping) {
+                    paths.updateState(id.name, be.e2);
+                }
+                else if (fe){
+                    string fieldstring = inFieldVar(paths.prgname, fe.f.name, 0); 
+                    if(fieldstring in paths.states[0].mapping) {
+                        paths.updateState(fieldstring, be.e2);
+                    }
+                    else {
+                        writeln("TODO: FieldExp: " ~ fe.toString() ~ " " ~ fieldstring);
+                        writeln(be);
+                    }
+                }
+                else {
+                    write("TODO: BinaryExp: ");
+                    writeln(be);
+                    paths.replaceFlips(be.e2);
+                }
+                return paths;
+            }else assert(0,text(stm));
+        }else if(auto ite=cast(IteExp)stm){
+            ProgramPath p1 = paths.copy();
+            ProgramPath p2 = paths.copy();
+
+            p1.updateCondition(ite.cond);
+            p1 = getAllExecutions(ite.then, p1);
+            p2.numFlips = p1.numFlips;          // Keep flip counts correct
+            p2.flipProbs = p1.flipProbs;          // Keep flip counts correct
+            p2.updateCondition(new UnaryExp!(Tok!"!")(ite.cond));
+            p2 = getAllExecutions(ite.othw, p2);
+
+            paths.states = new State[p1.states.length + p2.states.length];
+            paths.states[] = p1.states ~ p2.states;
+            paths.numFlips = p2.numFlips;
+            paths.flipProbs = p2.flipProbs;
+
+            return paths;
+        }else if(auto be=cast(BuiltInExp)stm){
+            // TODO: Replace with builtin state changes
+            if(be.which==Tok!"new") {
+                ProgramPath p = getAllExecutions(generateNew(paths.prgname, paths.capacity, paths.fields), paths);
+                return p;
+            }
+            if(be.which==Tok!"dup") return paths;
+            if(be.which==Tok!"drop") {
+                ProgramPath p = getAllExecutions(generateDrop(paths.prgname, paths.capacity, paths.fields), paths);
+                return p;
+            }
+        }else if(auto ce=cast(CallExp)stm){
+            auto be=cast(BuiltInExp)ce.e;
+            assert(be&&be.which==Tok!"fwd");
+            assert(ce.args.length==1);
+            ProgramPath p = getAllExecutions(generateFwd(paths.prgname, paths.capacity, paths.fields, ce.args[0]), paths);
+            return p;
+        }else if(auto ce=cast(CompoundExp)stm){
+            if(ce.s.length){
+                foreach(int i, Expression expr;ce.s){
+                    paths = getAllExecutions(expr, paths); 
+                }
+            }
+            return paths;
+        }
+        return paths;
+        //assert(0,text("TODO: ",stm));
+    }
+
+    ProgramPath getAllExecutions(Expression stm, string[] vars, string prgname, string[] packetFields) {
+
+        ProgramPath paths =  getAllExecutions(stm, new ProgramPath(vars, prgname, packetFields));
+        writeln(paths); 
+        writeln(paths.getPrismFlipDecl());
+        writeln(paths.getPrismGenRand());
+        writeln(paths.getPrismStep());
+        return paths;
+    }
+}
+
+
+string translate(Expression[] exprs, PrismBuilder bld){
+    Expression[][typeof(typeid(Object))] byTid;
+    foreach(expr;exprs){
+        assert(cast(Declaration)expr && expr.sstate==SemState.completed,text(expr));
+        byTid[typeid(expr)]~=expr;
+    }
+    auto all(T)(){ return cast(T[])byTid.get(typeid(T),[]); }
+    auto topology=all!TopologyDecl[0];
+    foreach(n;topology.nodes) bld.addNode(n.name.name);
+    foreach(l;topology.links) bld.addLink(l.a,l.b);
+    auto params=all!ParametersDecl.length?all!ParametersDecl[0]:null;
+    if(params) foreach(prm;params.params) bld.addParam(prm);
+    auto pfld=all!PacketFieldsDecl[0];
+    foreach(f;pfld.fields) bld.addPacketField(f.name.name);
+    auto pdcl=all!ProgramsDecl[0];
+    bld.addNumSteps(all!NumStepsDecl[0]);
+    if(all!QueueCapacityDecl.length) bld.addQueueCapacity(all!QueueCapacityDecl[0]);
+    foreach(q;all!QueryDecl) bld.addQuery(q);
+    void translateFun(FunctionDef fdef){
+        auto prg=bld.addProgram(fdef.name.name, fdef.body_);
+        if(fdef.state)
+            foreach(sd;fdef.state.vars)
+                prg.addState(sd.name.name,sd.init_);
+
+        string[] packetFields = bld.packetFields.map!(p => p.name).array;
+        //PrismProgramTranslator ppt = new PrismProgramTranslator();
+        //PrismProgramTranslator.ProgramPath paths = ppt.getAllExecutions(fdef.body_, prg.stateSet.keys, prg.name, packetFields);
+    }
+    foreach(fdef;all!FunctionDef){
+        if(fdef.name.name=="scheduler") bld.addScheduler(fdef);
+        else translateFun(fdef);
+    }
+    foreach(m;pdcl.mappings) bld.addProgram(m.node.name,m.prg.name);
+    foreach(p;all!PostObserveDecl) bld.addPostObserve(p.e);
+    return bld.toPRISM();
+}
