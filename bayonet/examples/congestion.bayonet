@@ -48,7 +48,7 @@ def s0(pkt, port) state s0_route1(0), s0_route2(0){
 	}else if port == 3{
 		s0_route1 = COST_01;
 		s0_route2 = COST_02 + COST_21;
-		if s0_route1 < s0_route2 or s0_route1 == s0_route2 and flip(1/2) {
+		if s0_route1 < s0_route2 or s0_route1 == s0_route2 and flip(1/2) == 1 {
 			fwd(1);
 		}else{
 			fwd(2);
@@ -68,7 +68,7 @@ def s1(pkt, port) state s1_route1(0), s1_route2(0){
 	}else if port == 3{
 		s1_route1 = COST_01;
 		s1_route2 = COST_02 + COST_21;
-		if s1_route1 < s1_route2 or s1_route1 == s1_route2 and flip(1/2){
+		if s1_route1 < s1_route2 or s1_route1 == s1_route2 and flip(1/2) == 1{
 			fwd(1);
 		}else{
 			fwd(2);

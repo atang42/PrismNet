@@ -3,6 +3,8 @@ import lexer, expression, declaration, util;
 
 import std.typecons: Q=Tuple,q=tuple;
 
+//TODO: Duplicate state variable names in multiple modules
+
 class PrismBuilder{
     class Variable{
         string name;
@@ -36,9 +38,10 @@ class PrismBuilder{
         string toPRISM(){
             //TODO: Get correct capacity
             //TODO: Get correct value ranges
-            int capacity = 3; 
+            int capacity = 2; 
             string r="module "~name~"\n";
 
+            // Input queue state
             string inStatements = "";
             for(int i = 0; i < capacity; i++)
             {
@@ -48,6 +51,7 @@ class PrismBuilder{
                 }
             }
 
+            // Output queue state
             string outStatements = "";
             for(int i = 0; i < capacity; i++)
             {
@@ -57,6 +61,7 @@ class PrismBuilder{
                 }
             }
 
+            // Queue size state
             string sizeVars = name ~ "_in_size : [0.."~capacity.to!string~"];\n" 
                             ~ name ~ "_out_size : [0.."~capacity.to!string~"];\n";
 
@@ -67,19 +72,21 @@ class PrismBuilder{
                 "\n"
                 );
 
+            // User defined state
             foreach(string var; stateSet.keys.sort) {
-                r~= indent(var ~ ": int;\n");
+                r~= indent(var ~ ": [0..MAX_VAR_VALUE];\n");
             }
 
             string[] fields = packetFields.map!(v => v.name).array;
             PrismProgramTranslator ppt = new PrismProgramTranslator();
             PrismProgramTranslator.ProgramPath paths = ppt.getAllExecutions(prgbody, stateSet.keys, name, fields);
 
-            r~= indent(paths.getPrismFlipDecl());
-            r~= indent(paths.getPrismGenRand());
-            r~= indent(paths.getPrismStep());
+            r~= indent(paths.getPrismFlipDecl()) ~ "\n";
+            r~= indent(paths.getPrismGenRand()) ~ "\n";
+            r~= indent(paths.getPrismStep()) ~ "\n";
             r~="endmodule\n";
 
+            getPRISMLinks(name);
             return r;
         }
         void[0][string] stateSet;
@@ -129,11 +136,33 @@ class PrismBuilder{
         queries~=query.query;
     }
 
-    string toPRISM(){
-        auto nodedef="const int k = "~text(nodes.length)~";\n"~iota(nodes.length).map!(k=>text("const ",nodes[k]," = ",k)).join(";\n")~(nodes.length?";\n":"");
-        auto paramdef=params.map!(p=>"const int "~ p.name.toString()~" = "~(p.init_?p.init_.toString():"?"~p.name.toString())).join(";\n")~(params.length?";\n\n":"");
+    string prgToNode(string prgname) {
+        foreach(string s; nodes) {
+            if(programs[nodeProg[nodeId[s]]].name == prgname)
+                return s;
+        }
+        assert(0, "Cannot find node for " ~ prgname);
+    }        
 
-        return nodedef~paramdef~programs.map!(a=>a.toPRISM()~"\n").join;
+    string getPRISMLinks(string name) {
+        string node = prgToNode(name);
+        foreach(int i; links[node].keys) {
+            string neighbor = links[node][i][0];
+            int neighborPort = links[node][i][1];
+            writeln(node, " ", i, " <-> ", neighbor, " ", neighborPort);
+
+            string action = "["~node~"_"~neighbor~"_link] ";
+        }
+        return "";
+    }
+
+
+    string toPRISM(){
+        auto maxvaldef="const int MAX_VAR_VALUE = " ~ text(this.maxValue) ~ ";\n";
+        auto nodedef="const int k = "~text(nodes.length)~";\n"~iota(nodes.length).map!(k=>text("const int ",nodes[k]," = ",k)).join(";\n")~(nodes.length?";\n":"");
+        auto paramdef=params.map!(p=>"const double "~ p.name.toString()~" = "~(p.init_?p.init_.toString():"?"~p.name.toString())).join(";\n")~(params.length?";\n\n":"");
+
+        return nodedef~maxvaldef~paramdef~programs.map!(a=>a.toPRISM()~"\n").join;
     }
 
     Variable[] packetFields;
@@ -149,6 +178,8 @@ class PrismBuilder{
     Expression num_steps;
     Expression capacity;
     Expression[] postObserves;
+    // TODO: Set proper maxValue
+    int maxValue = 10;
 }
 
 class PrismProgramTranslator {
@@ -197,13 +228,12 @@ class PrismProgramTranslator {
         Expression[] flipProbs;
         string prgname;
         string[] fields;
-        int capacity;
+        //TODO: Get correct capacity
+        int capacity = 2;
 
         this () {}
 
         this(string[] variables, string prgname, string[] packetFields) {
-            //TODO: Get correct capacity
-            this.capacity = 3;
             void[0][string] queueVariables;
             queueVariables[prgname~"_in_size"] = [];
             queueVariables[prgname~"_out_size"] = [];
@@ -297,18 +327,18 @@ class PrismProgramTranslator {
             string action = "[" ~ prgname ~ "Step] ";
 
             string ret = "";
-            string hasFlipsImplies = numFlips > 0 ? prgname~"HasFlips -> " : "true -> ";
-            string hasFlipsAnd = numFlips > 0 ? prgname~"HasFlips & " : "";
-            string hasFlipsZero = numFlips > 0 ? " & (" ~prgname~"HasFlips'=false)" : "";
+            string queueNotEmpty = inSizeVar(prgname) ~ " > 0 ";
+            string hasFlips = numFlips > 0 ? " & "~prgname~"HasFlips" : "";
+            string hasFlipsZero = numFlips > 0 ? "(" ~prgname~"HasFlips'=false)" : "";
             foreach(State st; this.states) {
                 if(st.condition !is null) {
                     string cond = st.condition.toString.replace("and", "&");
                     cond = cond.replace(" or ", " | ");
                     cond = cond.replace("==", "=");
-                    ret ~= action ~ hasFlipsAnd ~ cond ~ " -> ";
+                    ret ~= action ~ queueNotEmpty ~ hasFlips ~ " & " ~ cond ~ " -> ";
                 }
                 else {
-                    ret ~= action ~ hasFlipsImplies;
+                    ret ~= action ~ queueNotEmpty ~ hasFlips ~ " -> ";
                 }
                 bool first = true;
                 foreach(string s, Expression exp; st.mapping) {
@@ -321,9 +351,13 @@ class PrismProgramTranslator {
                     first = false;
                     ret ~= "(" ~ s ~ "'=" ~ exp.toString() ~ ")";
                 }
-                if(first) // no change in state
+                if(!first && numFlips > 0) {
+                    ret ~= " & ";
+                    ret ~= hasFlipsZero;
+                }
+                else if(first) {
                     ret ~= "true";
-                ret ~= hasFlipsZero;
+                }
                 ret ~= ";\n";
             }
             return ret;
@@ -677,10 +711,6 @@ class PrismProgramTranslator {
     ProgramPath getAllExecutions(Expression stm, string[] vars, string prgname, string[] packetFields) {
 
         ProgramPath paths =  getAllExecutions(stm, new ProgramPath(vars, prgname, packetFields));
-        writeln(paths); 
-        writeln(paths.getPrismFlipDecl());
-        writeln(paths.getPrismGenRand());
-        writeln(paths.getPrismStep());
         return paths;
     }
 }

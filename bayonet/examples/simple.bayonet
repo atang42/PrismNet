@@ -25,7 +25,7 @@ def h0(pkt,port) state h0_pkt_count(0){
 
 def s0(pkt,port){
     if port == 1{
-		if flip(Pr){
+		if flip(Pr) == 1{
 			fwd(2);
 		}else{
 			drop;
