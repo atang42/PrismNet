@@ -166,7 +166,7 @@ class PrismBuilder{
             int neighborPort = links[node][port][1];
             Program neighborPrg = programs[nodeProg[nodeId[neighbor]]];
 
-            writeln(node, " ", port, " ", name, " <-> ", neighbor, " ", neighborPrg.name, " ", neighborPort);
+            //writeln(node, " ", port, " ", name, " <-> ", neighbor, " ", neighborPrg.name, " ", neighborPort);
 
             // Sender Actions
             {
@@ -185,7 +185,7 @@ class PrismBuilder{
                 pktActions ~= ";\n";
 
                 ret ~= action ~ condition ~ sendSizeAction ~ pktActions;
-                writeln(action, condition, sendSizeAction, pktActions);
+                //writeln(action, condition, sendSizeAction, pktActions);
             }
             ret ~= "\n";
             // Receiver Actions
@@ -213,7 +213,7 @@ class PrismBuilder{
                 pktActions ~= ";\n";
 
                 ret ~= action ~ condition ~ portAction ~ recvSizeAction ~ pktActions;
-                writeln(action, condition, portAction, recvSizeAction, pktActions);
+                //writeln(action, condition, portAction, recvSizeAction, pktActions);
             }
             ret ~= "\n";
         }
