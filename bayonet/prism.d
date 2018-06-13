@@ -1,4 +1,4 @@
-import std.conv, std.algorithm, std.range, std.array;
+import std.conv, std.algorithm, std.range, std.array, std.string;
 import lexer, expression, declaration, util;
 
 import std.typecons: Q=Tuple,q=tuple;
@@ -26,6 +26,9 @@ class PrismBuilder{
         string name;
         Expression prgbody;
         string[] pFields;
+        //TODO: Get correct capacity
+        int inCapacity = 2;
+        int outCapacity = 1;
 
         this(string name, Expression prgbody){
             this.name=name;
@@ -36,14 +39,12 @@ class PrismBuilder{
             stateSet[name]=[];
         }
         string toPRISM(){
-            //TODO: Get correct capacity
             //TODO: Get correct value ranges
-            int capacity = 2; 
             string r="module "~name~"\n";
 
             // Input queue state
             string inStatements = "";
-            for(int i = 0; i < capacity; i++)
+            for(int i = 0; i < inCapacity; i++)
             {
                 inStatements ~= name ~ "_in"~to!string(i)~"_port: [0..k];\n";
                 foreach(Variable var; packetFields) {
@@ -53,7 +54,7 @@ class PrismBuilder{
 
             // Output queue state
             string outStatements = "";
-            for(int i = 0; i < capacity; i++)
+            for(int i = 0; i < outCapacity; i++)
             {
                 outStatements ~= name ~ "_out"~to!string(i)~"_port: [0..k];\n";
                 foreach(Variable var; packetFields) {
@@ -62,13 +63,20 @@ class PrismBuilder{
             }
 
             // Queue size state
-            string sizeVars = name ~ "_in_size : [0.."~capacity.to!string~"];\n" 
-                            ~ name ~ "_out_size : [0.."~capacity.to!string~"];\n";
+            string inSizeDecl;
+            if(this == programs[0]) {
+                inSizeDecl = name ~ "_in_size : [0.."~inCapacity.to!string~"] init 1;\n";
+            }
+            else {
+                inSizeDecl = name ~ "_in_size : [0.."~inCapacity.to!string~"];\n";
+            }
+            string outSizeDecl = name ~ "_out_size : [0.."~outCapacity.to!string~"];\n";
 
             r~=indent(
                 inStatements ~
                 outStatements ~
-                sizeVars ~
+                inSizeDecl ~
+                outSizeDecl ~
                 "\n"
                 );
 
@@ -84,9 +92,10 @@ class PrismBuilder{
             r~= indent(paths.getPrismFlipDecl()) ~ "\n";
             r~= indent(paths.getPrismGenRand()) ~ "\n";
             r~= indent(paths.getPrismStep()) ~ "\n";
-            r~="endmodule\n";
 
-            getPRISMLinks(name);
+            r~= indent(getPRISMLinks(name)) ~ "\n";
+
+            r~="endmodule\n";
             return r;
         }
         void[0][string] stateSet;
@@ -136,6 +145,7 @@ class PrismBuilder{
         queries~=query.query;
     }
 
+    // Find the node name for a given program
     string prgToNode(string prgname) {
         foreach(string s; nodes) {
             if(programs[nodeProg[nodeId[s]]].name == prgname)
@@ -145,22 +155,78 @@ class PrismBuilder{
     }        
 
     string getPRISMLinks(string name) {
+        // TODO: implement queueing
         string node = prgToNode(name);
-        foreach(int i; links[node].keys) {
-            string neighbor = links[node][i][0];
-            int neighborPort = links[node][i][1];
-            writeln(node, " ", i, " <-> ", neighbor, " ", neighborPort);
+        Program prg = programs[nodeProg[nodeId[node]]];
+        string[] fields = packetFields.map!(v => v.name).array;
+        string ret;
+        // For each link
+        foreach(int port; links[node].keys) {
+            string neighbor = links[node][port][0];
+            int neighborPort = links[node][port][1];
+            Program neighborPrg = programs[nodeProg[nodeId[neighbor]]];
 
-            string action = "["~node~"_"~neighbor~"_link] ";
+            writeln(node, " ", port, " ", name, " <-> ", neighbor, " ", neighborPrg.name, " ", neighborPort);
+
+            // Sender Actions
+            {
+                string action = "["~node~"_"~neighbor~"_link] ";
+                string condition = name ~ "_out_size > 0"                                   // Sender has packet
+                         ~ " & " ~ name ~ "_out0_port = " ~ port.to!string ~ " -> ";        // Sender port is to destination
+                string sendSizeAction = "(" ~ name ~ "_out_size' = " ~ name ~ "_out_size-1)";
+                string pktActions = "";
+                foreach(string field; fields) {
+                    // Shift output queue
+                    for(int i = prg.outCapacity-2; i >= 0; i--) {
+                        pktActions ~= " & (" ~ prg.name ~ "_out" ~ i.to!string ~ "_pkt_" ~ field ~ "'" 
+                                    ~ " = " ~ prg.name ~ "_out" ~ (i+1).to!string ~ "_pkt_" ~ field ~ ")";
+                    }
+                }
+                pktActions ~= ";\n";
+
+                ret ~= action ~ condition ~ sendSizeAction ~ pktActions;
+                writeln(action, condition, sendSizeAction, pktActions);
+            }
+            ret ~= "\n";
+            // Receiver Actions
+            for(int recvQSize = 0; recvQSize <= prg.inCapacity; recvQSize++) {
+
+                string action = "["~neighbor~"_"~node~"_link] ";
+                string condition = name ~ "_in_size = " ~ recvQSize.to!string   // Size of receiving queue
+                         ~ " & " ~ neighborPrg.name ~ "_out_size > 0"                                   // Sender has packet
+                         ~ " & " ~ neighborPrg.name ~ "_out0_port = " ~ neighborPort.to!string ~ " -> ";        // Sender port is to destination
+                // Drop packet if max capacity
+                string portAction = "";
+                string recvSizeAction = "";
+                string pktActions = "";
+                if( recvQSize < prg.inCapacity) {
+                    portAction = "(" ~ name ~ "_in" ~ recvQSize.to!string ~ "_port' = " ~ port.to!string ~ ")"; 
+                    recvSizeAction = " & (" ~ name ~ "_in_size' = " ~ name ~ "_in_size+1)";
+                    foreach(string field; fields) {
+                        pktActions ~= " & (" ~ name ~ "_in" ~ recvQSize.to!string ~ "_pkt_" ~ field ~ "'"
+                                    ~ " = " ~ neighborPrg.name ~ "_out0_pkt_" ~ field ~ ")";
+                    }
+                }
+                else {
+                    pktActions = "true";
+                }
+                pktActions ~= ";\n";
+
+                ret ~= action ~ condition ~ portAction ~ recvSizeAction ~ pktActions;
+                writeln(action, condition, portAction, recvSizeAction, pktActions);
+            }
+            ret ~= "\n";
         }
-        return "";
+        return ret;
     }
 
 
     string toPRISM(){
         auto maxvaldef="const int MAX_VAR_VALUE = " ~ text(this.maxValue) ~ ";\n";
         auto nodedef="const int k = "~text(nodes.length)~";\n"~iota(nodes.length).map!(k=>text("const int ",nodes[k]," = ",k)).join(";\n")~(nodes.length?";\n":"");
-        auto paramdef=params.map!(p=>"const double "~ p.name.toString()~" = "~(p.init_?p.init_.toString():"?"~p.name.toString())).join(";\n")~(params.length?";\n\n":"");
+
+        auto initToType = (string s) => (indexOf(s, ".") != -1 ? " double " : " int ");
+        auto paramdef=params.map!(p=>"const" ~ initToType(p.init_.toString()) ~ p.name.toString()~" = "~(p.init_?p.init_.toString():"?"~p.name.toString())).join(";\n")~(params.length?";\n\n":"");
 
         return nodedef~maxvaldef~paramdef~programs.map!(a=>a.toPRISM()~"\n").join;
     }
@@ -229,7 +295,8 @@ class PrismProgramTranslator {
         string prgname;
         string[] fields;
         //TODO: Get correct capacity
-        int capacity = 2;
+        int inCapacity = 2;
+        int outCapacity = 1;
 
         this () {}
 
@@ -237,11 +304,15 @@ class PrismProgramTranslator {
             void[0][string] queueVariables;
             queueVariables[prgname~"_in_size"] = [];
             queueVariables[prgname~"_out_size"] = [];
-            for(int i = 0; i < capacity; i++) {
+            for(int i = 0; i < inCapacity; i++) {
                 queueVariables[prgname~"_in"~to!string(i)~"_port"] = [];
-                queueVariables[prgname~"_out"~to!string(i)~"_port"] = [];
                 foreach(string f; packetFields) {
                     queueVariables[prgname~"_in"~to!string(i)~"_pkt_"~f] = [];
+                }
+            }
+            for(int i = 0; i < outCapacity; i++) {
+                queueVariables[prgname~"_out"~to!string(i)~"_port"] = [];
+                foreach(string f; packetFields) {
                     queueVariables[prgname~"_out"~to!string(i)~"_pkt_"~f] = [];
                 }
             }
@@ -257,7 +328,8 @@ class PrismProgramTranslator {
             c.flipProbs = this.flipProbs;
             c.prgname = this.prgname;
             c.fields = this.fields;
-            c.capacity = this.capacity;
+            c.inCapacity = this.inCapacity;
+            c.outCapacity = this.outCapacity;
             c.states = new State[this.states.length];
             foreach(int i, State s; this.states) {
                 c.states[i] = s.copy();
@@ -328,37 +400,50 @@ class PrismProgramTranslator {
 
             string ret = "";
             string queueNotEmpty = inSizeVar(prgname) ~ " > 0 ";
-            string hasFlips = numFlips > 0 ? " & "~prgname~"HasFlips" : "";
+            string outNotFull = " & " ~ outSizeVar(prgname) ~ " < " ~ outCapacity.to!string ~ " ";
+            string hasFlipsCond = numFlips > 0 ? " & "~prgname~"HasFlips" : "";
             string hasFlipsZero = numFlips > 0 ? "(" ~prgname~"HasFlips'=false)" : "";
+
             foreach(State st; this.states) {
+
+                string prismCond;
                 if(st.condition !is null) {
                     string cond = st.condition.toString.replace("and", "&");
                     cond = cond.replace(" or ", " | ");
                     cond = cond.replace("==", "=");
-                    ret ~= action ~ queueNotEmpty ~ hasFlips ~ " & " ~ cond ~ " -> ";
+                    prismCond = queueNotEmpty ~ outNotFull ~ hasFlipsCond ~ " & " ~ cond;
                 }
                 else {
-                    ret ~= action ~ queueNotEmpty ~ hasFlips ~ " -> ";
+                    prismCond = queueNotEmpty ~ hasFlipsCond;
                 }
+
+                string prismActions;
+                string prismBoundsCheck;
                 bool first = true;
                 foreach(string s, Expression exp; st.mapping) {
                     if(s.equal(exp.toString())) {
                         continue;
                     }
+                    if(indexOf(exp.toString(), "+") != -1) {
+                        // Adds bound condition if next is defined by adding constant
+                        // TODO: Does not cover all cases
+                        prismBoundsCheck ~= " & " ~ exp.toString() ~ " < MAX_VAR_VALUE ";
+                    }
                     if(!first) {
-                        ret ~= " & ";
+                        prismActions ~= " & ";
                     }
                     first = false;
-                    ret ~= "(" ~ s ~ "'=" ~ exp.toString() ~ ")";
+                    prismActions ~= "(" ~ s ~ "'=" ~ exp.toString() ~ ")";
                 }
+
                 if(!first && numFlips > 0) {
-                    ret ~= " & ";
-                    ret ~= hasFlipsZero;
+                    prismActions ~= " & ";
+                    prismActions ~= hasFlipsZero;
                 }
                 else if(first) {
-                    ret ~= "true";
+                    prismActions ~= "true";
                 }
-                ret ~= ";\n";
+                ret ~= action ~ prismCond ~ prismBoundsCheck ~ " -> " ~ prismActions ~ ";\n";
             }
             return ret;
         }
@@ -523,6 +608,10 @@ class PrismProgramTranslator {
             Expression inField = new Identifier(inFieldVar(prgname, f, 0));
             assigns ~= new AssignExp(outField, inField);
         }
+        Expression outSize = new Identifier(outSizeVar(prgname));
+        Token ztok = Token(Tok!"0");
+        ztok.str = "1";
+        assigns ~= new AssignExp(outSize, new LiteralExp(ztok));
 
         // Shift elements in input queue
         for(int i = 0; i < capacity - 1; i++)
@@ -551,7 +640,7 @@ class PrismProgramTranslator {
         this(Expression left, string op, Expression right) { super(left, right); this.op = op; }
 
         override string toString() {
-            return _brk(e1.toString() ~ " " ~ op ~ " " ~ e2.toString());
+            return _brk("(" ~ e1.toString() ~ " " ~ op ~ " " ~ e2.toString() ~ ")");
         }
         override @property string operator() { return op; }
     }
@@ -682,19 +771,19 @@ class PrismProgramTranslator {
         }else if(auto be=cast(BuiltInExp)stm){
             // TODO: Replace with builtin state changes
             if(be.which==Tok!"new") {
-                ProgramPath p = getAllExecutions(generateNew(paths.prgname, paths.capacity, paths.fields), paths);
+                ProgramPath p = getAllExecutions(generateNew(paths.prgname, paths.inCapacity, paths.fields), paths);
                 return p;
             }
             if(be.which==Tok!"dup") return paths;
             if(be.which==Tok!"drop") {
-                ProgramPath p = getAllExecutions(generateDrop(paths.prgname, paths.capacity, paths.fields), paths);
+                ProgramPath p = getAllExecutions(generateDrop(paths.prgname, paths.inCapacity, paths.fields), paths);
                 return p;
             }
         }else if(auto ce=cast(CallExp)stm){
             auto be=cast(BuiltInExp)ce.e;
             assert(be&&be.which==Tok!"fwd");
             assert(ce.args.length==1);
-            ProgramPath p = getAllExecutions(generateFwd(paths.prgname, paths.capacity, paths.fields, ce.args[0]), paths);
+            ProgramPath p = getAllExecutions(generateFwd(paths.prgname, paths.inCapacity, paths.fields, ce.args[0]), paths);
             return p;
         }else if(auto ce=cast(CompoundExp)stm){
             if(ce.s.length){

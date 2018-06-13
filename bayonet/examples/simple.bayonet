@@ -1,8 +1,9 @@
 num_steps 10;
+
 query expectation(h0_pkt_count@H0);
 query expectation(s0_pkt_count@H1);
 
-parameters{ Pr }
+parameters { Pr(0.7) }
 
 topology{
     nodes{H0,H1,S0}
